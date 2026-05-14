@@ -20,16 +20,16 @@ import re
 import requests
 from datetime import datetime
 from typing import Optional, Tuple, List
-from PIL import Image, ImageChops, ImageEnhance
+from PIL import Image, ImageChops
 from mano.executor import ActionExecutor
 
 # ─── 常量 ────────────────────────────────────────────
 PID_FILE = "logs/pid.txt"
 
-# 企业微信三列布局（基于1060px窗口实测）
-# 第一列162px(15.3%)，第二列252px(23.8%)，第三列剩余(60.9%)
-COL2_START_RATIO = 0.153
-COL2_WIDTH_RATIO = 0.238
+# 企业微信三列布局（基于窗口比例）
+# 第一列（功能列表）约占窗口6-7%宽，第二列从7%开始确保不包含第一列
+COL2_RATIO = {"x": 0.15, "y": 0.00, "width": 0.237, "height": 1.00}   # 群聊列表 (15%~38.7%)
+COL3_RATIO = {"x": 0.387, "y": 0.00, "width": 0.613, "height": 1.00}   # 会话窗口 (38.7%~100%)
 
 # 红点检测参数
 RED_R_MIN = 180
@@ -53,9 +53,9 @@ class WeComAssistant:
         # 去重
         self._processed_hashes = set()
 
-        # 冷却（防止同一群反复回复）
+        # 冷却（防止同一话题反复回复）
         self._last_reply_time = 0
-        self._reply_cooldown = 10
+        self._reply_cooldown = 10  # 回复后冷却10秒，同一群不连续回
 
         # AI 配置
         ai_cfg = self.config.get("ai", {})
@@ -140,7 +140,8 @@ class WeComAssistant:
         return default
 
     def _signal_handler(self, signum, frame):
-        print(f"\n🛑 收到信号 {signum}，正在停止...")
+        print(f"
+🛑 收到信号 {signum}，正在停止...")
         self.running = False
 
     def _log(self, level: str, msg: str):
@@ -173,25 +174,12 @@ class WeComAssistant:
             pass
         return False
 
-    def _get_col2_region(self):
-        """第二列（群聊列表）区域"""
+    def _get_region(self, ratio: dict) -> Optional[Tuple[int, int, int, int]]:
         if not self.wecom_region:
             return None
         l, t, w, h = self.wecom_region
-        col2_x = l + int(w * COL2_START_RATIO)
-        col2_w = int(w * COL2_WIDTH_RATIO)
-        if col2_x + col2_w > l + w:
-            col2_w = l + w - col2_x
-        return (col2_x, t, col2_w, h)
-
-    def _get_col3_region(self):
-        """第三列（会话窗口）区域"""
-        if not self.wecom_region:
-            return None
-        l, t, w, h = self.wecom_region
-        col3_x = l + int(w * (COL2_START_RATIO + COL2_WIDTH_RATIO))
-        col3_w = w - int(w * (COL2_START_RATIO + COL2_WIDTH_RATIO))
-        return (col3_x, t, col3_w, h)
+        return (l + int(w * ratio["x"]), t + int(h * ratio["y"]),
+                int(w * ratio["width"]), int(h * ratio["height"]))
 
     def _focus_wecom(self):
         try:
@@ -402,27 +390,17 @@ class WeComAssistant:
             return False
 
     def _ocr_image(self, img: Image.Image) -> str:
-        """提取图片文字（带图像增强预处理）"""
+        """提取图片文字"""
         if not self._init_ocr():
             return ""
         try:
-            # 图像增强：放大+提高对比度，EasyOCR对模糊小图识别差
-            w, h = img.size
-            if h < 150:
-                scale = 200.0 / h
-                img = img.resize((int(w * scale), 200), Image.LANCZOS)
-            
-            # 提高对比度
-            from PIL import ImageEnhance
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.5)
-            
             # EasyOCR 需要 numpy array
             import numpy as np
             img_np = np.array(img)
             results = self.ocr.readtext(img_np)
             texts = [text.strip() for _, text, conf in results if conf > 0.3]
-            return "\n".join(texts)
+            return "
+".join(texts)
         except Exception as e:
             self._log("WARN", f"⚠️ OCR 识别失败: {e}")
             return ""
@@ -463,10 +441,21 @@ class WeComAssistant:
                     "messages": [
                         {"role": "system", "content": system_content},
                         {"role": "user", "content":
-                            f"客户的提问：\n\n{ocr_text}\n\n直接回复客户问题。不要自我介绍，不要开场白，不要输出「@微信」等内部术语。不超过150字。"}
+                            f"以下是群聊截图OCR识别结果（可能含UI标签、时间戳、系统通知等噪音）：
+
+"
+                            f"{ocr_text}
+
+"
+                            f"请从以上OCR文本中识别出外部客户的最新提问（客户昵称旁有绿色标识），"
+                            f"然后以快亮家装饰客服的身份回复。忽略系统通知、UI标签和内部成员消息。"
+                            f"如果看到AI助理自己的历史回复，忽略它。"
+                            f"直接回答客户问题，自然友好像朋友聊天，不超过150字。"
+                            f"不知道的坦诚说不知道，引导联系人工客服。"
+                            f"注意：回复中不要出现「@微信」「(@微信)」这类内部技术术语。"}
                     ],
-                    "temperature": 0.7,
-                    "max_tokens": 200,
+                    "temperature": 0.8,
+                    "max_tokens": 300,
                 },
                 timeout=20
             )
@@ -482,176 +471,208 @@ class WeComAssistant:
             self._log("WARN", f"⚠️ AI 回复异常: {e}")
             return None
 
-    # ─── 智能表格写入（MCP） ─────────────────────
+    # ─── 提取最底部灰色气泡（客户最新消息） ─────────
 
-    def _save_to_smart_sheet(self, question: str, reply: str):
-        """将客户问题和AI回复写入企业微信智能表格"""
-        ss = self.config.get("smart_sheet", {})
-        if not ss.get("enabled", False):
-            return
-        docid = ss.get("docid", "")
-        sheet_id = ss.get("sheet_id", "")
-        if not docid or not sheet_id:
-            self._log("WARN", "⚠️ 智能表格未配置 docid/sheet_id，跳过写入")
-            return
+    def _extract_latest_gray_bubble(self, img: Image.Image):
 
-        try:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        """从聊天区截图中提取最底部的灰色气泡（最新消息）。
 
-            records = [{
-                "values": {
-                    "客户问题": [{"type": "text", "text": question[:500]}],
-                    "AI回复": [{"type": "text", "text": reply[:500]}],
-                    "记录时间": now
-                }
-            }]
+        
 
-            params = json.dumps({
-                "docid": docid,
-                "sheet_id": sheet_id,
-                "records": records
-            }, ensure_ascii=False)
+        从底部往上扫描，找到第一个非空白区域：
 
-            # 准备环境变量
-            env = os.environ.copy()
-            if not env.get("WECOM_BOT_ID") or not env.get("WECOM_SECRET"):
-                env_file = os.path.expanduser("~/.hermes/.env")
-                if os.path.exists(env_file):
-                    with open(env_file) as f:
-                        for line in f:
-                            line = line.strip()
-                            if line.startswith("WECOM_BOT_ID"):
-                                env["WECOM_BOT_ID"] = line.split("=", 1)[1].strip().strip('"').strip("'")
-                            elif line.startswith("WECOM_SECRET"):
-                                env["WECOM_SECRET"] = line.split("=", 1)[1].strip().strip('"').strip("'")
+        1. 如果该区域以灰色为主 → 灰色气泡（客户/内部成员消息）→ 裁剪返回
 
-            if not env.get("WECOM_BOT_ID") or not env.get("WECOM_SECRET"):
-                self._log("WARN", "⚠️ 未配置 WECOM_BOT_ID/WECOM_SECRET，无法写入智能表格")
-                return
+        2. 如果该区域以蓝色为主 → 蓝色气泡（AI自己发的）→ 返回None
 
-            mcp_client = os.path.expanduser("~/.hermes/workspace/wecom_mcp_client.py")
-            if not os.path.exists(mcp_client):
-                self._log("WARN", "⚠️ wecom_mcp_client.py 不存在，跳过智能表格写入")
-                return
+        3. 如果没找到内容 → 返回None
 
-            r = subprocess.run(
-                [sys.executable, mcp_client, "call", "doc", "smartsheet_add_records", params],
-                capture_output=True, text=True, timeout=30, env=env
-            )
-            if r.returncode == 0:
-                self._log("INFO", "📊 客户问题已写入智能表格 ✓")
-            else:
-                err = r.stderr.strip() or r.stdout.strip()[:100]
-                self._log("WARN", f"⚠️ 智能表格写入失败: {err[:100]}")
-
-        except subprocess.TimeoutExpired:
-            self._log("WARN", "⚠️ 智能表格写入超时(30s)")
-        except Exception as e:
-            self._log("WARN", f"⚠️ 智能表格写入异常: {e}")
-
-    # ─── 提取底部完整灰色气泡+昵称区域 ───────────
-
-    def _extract_bottom_message(self, img):
-        """找到底部最后一个气泡，完整截取气泡+上方50像素昵称区域。
-        返回 (裁剪图, 是否是蓝色气泡)
         """
+
         pixels = img.load()
+
         w, h = img.size
+
         
-        # 第一步：从底部往上找气泡底部（第一个有内容的行）
+
+        # 第一步：从底部往上找第一个有内容的行（非纯白）
+
         last_content_y = -1
-        for y in range(h - 1, max(int(h * 0.15), 1), -1):
+
+        for y in range(h - 1, int(h * 0.15), -1):
+
             non_white = 0
+
             for x in range(w):
+
                 r, g, b = pixels[x, y][:3]
-                if not (r > 235 and g > 235 and b > 235):  # 放宽到235，浅灰算白
+
+                if not (r > 248 and g > 248 and b > 248):
+
                     non_white += 1
-            if non_white > w * 0.03:
+
+            if non_white > w * 0.03:  # 超过3%的像素有颜色
+
                 last_content_y = y
+
                 break
+
         
+
         if last_content_y < 0:
-            return None, False
+
+            return None
+
         
-        # 第二步：从底部往上找气泡顶部（消息间隔=连续5行以上基本空白）
+
+        # 第二步：从last_content_y往上找到消息顶部（连续空白行）
+
         blank_streak = 0
+
         bubble_top = 0
-        for y in range(last_content_y, max(int(h * 0.05), 1), -1):
+
+        for y in range(last_content_y, int(h * 0.05), -1):
+
             non_white = 0
+
             for x in range(w):
+
                 r, g, b = pixels[x, y][:3]
-                if not (r > 235 and g > 235 and b > 235):
+
+                if not (r > 248 and g > 248 and b > 248):
+
                     non_white += 1
-            if non_white < w * 0.02:
+
+            if non_white < w * 0.02:  # 基本空白行
+
                 blank_streak += 1
-                if blank_streak >= 5:  # 连续5行空白=消息间隔
+
+                if blank_streak >= 3:  # 连续3行空白 = 消息间隔
+
                     bubble_top = y + blank_streak
+
                     break
+
             else:
+
                 blank_streak = 0
+
         
-        # 安全保护：如果没找到气泡顶部，fallback
-        if bubble_top >= last_content_y - 5 or bubble_top == 0:
-            bubble_top = max(0, last_content_y - 200)  # 最多取200像素高区域
+
+        # 安全保护
+
+        if bubble_top >= last_content_y - 5:
+
+            bubble_top = max(0, last_content_y - 120)  # 最多取120px高
+
         
-        # 第三步：往上延伸30像素包含昵称区域
-        crop_top = max(0, bubble_top - 30)
-        crop_bottom = min(last_content_y + 5, h - 1)
-        
-        # 确保区域至少50像素高
-        if crop_bottom - crop_top < 50:
-            crop_top = max(0, crop_bottom - 50)
-        
+
+        # 第三步：裁剪出底部气泡区域
+
         margin = 5
-        msg_img = img.crop((margin, crop_top, w - margin, crop_bottom))
+
+        bubble_img = img.crop((margin, bubble_top, w - margin, min(last_content_y + 3, h - 1)))
+
         
-        # 第四步：判断气泡类型——只检查右侧50%（蓝色气泡靠右）
-        check_pixels = msg_img.load()
-        cw, ch = msg_img.size
-        check_start_x = cw // 2
-        
+
+        # 第四步：判断气泡类型——统计蓝色 vs 灰色像素
+
+        b_pixels = bubble_img.load()
+
+        bw, bh = bubble_img.size
+
         blue_px = 0
-        total_check = 0
-        for by in range(ch):
-            for bx in range(check_start_x, cw):
-                r, g, b = check_pixels[bx, by][:3]
-                total_check += 1
-                if b > r + 30 and b > g + 20 and b > 120:
+
+        gray_px = 0
+
+        total_px = bw * bh
+
+        
+
+        for by in range(bh):
+
+            for bx in range(bw):
+
+                r, g, b = b_pixels[bx, by][:3]
+
+                # 蓝色调像素
+
+                if b > r and b > g and b > 80:
+
                     blue_px += 1
+
+                # 灰色调像素（R≈G≈B，不算白）
+
+                elif max(r,g,b) - min(r,g,b) < 30 and r > 150 and r < 248:
+
+                    gray_px += 1
+
         
-        blue_ratio = blue_px / total_check if total_check > 0 else 0
-        is_blue = blue_ratio > 0.05
+
+        blue_ratio = blue_px / total_px if total_px > 0 else 0
+
+        gray_ratio = gray_px / total_px if total_px > 0 else 0
+
         
-        self._log("DEBUG", f"底部消息: 右侧蓝{blue_ratio:.1%} 区域({crop_top}-{crop_bottom}) {'🟦蓝泡' if is_blue else '⬜灰泡'}")
+
+        self._log("DEBUG", f"气泡分析: 蓝色{blue_ratio:.1%} 灰色{gray_ratio:.1%} 区域({bubble_top}-{last_content_y})")
+
         
-        return msg_img, is_blue
+
+        # 蓝色比例高 → 是AI自己的蓝色气泡，跳过
+
+        if blue_ratio > 0.02:
+
+            self._log("INFO", "⏭️ 最新消息是蓝色气泡（AI自己发的），跳过")
+
+            return None
+
+        
+
+        # 灰色比例低且内容太少 → 可能是噪音
+
+        if gray_ratio < 0.005 and bh < 20:
+
+            return None
+
+        
+
+        return bubble_img
 
     # ─── 检测 @微信 绿色标识 ──────────────────────
 
-    def _has_green_badge(self, img):
-        """检测截图中是否有绿色文字（@微信标识是绿色小字）"""
+    def _has_green_badge(self, img: Image.Image) -> bool:
+        """检测截图中是否有绿色文字（@微信标识是绿色小字）
+        
+        强哥要求：聊天框里绿色的文字就是 @微信 标识。
+        放宽阈值，见绿就算。
+        """
         try:
             pixels = img.load()
             w, h = img.size
             if w < 10 or h < 10:
                 return False
-            # 全图扫描（图片已经是裁剪后的消息区域）
+            # 扫描聊天区全局，找绿色像素（阈值放宽）
+            scan_y_start = int(h * 0.15)
+            scan_y_end = int(h * 0.9)
             green_count = 0
-            for y in range(h):
+            for y in range(scan_y_start, scan_y_end):
                 for x in range(w):
                     r, g, b = pixels[x, y][:3]
+                    # 绿色文字特征：g明显高于r和b，饱和度不需要太高
                     if g > 100 and g > r * 1.3 and g > b * 1.3:
                         green_count += 1
-                        if green_count > 10:  # 10个绿色像素就够
+                        if green_count > 20:  # 20个绿色像素就够
                             return True
             return False
         except Exception:
             return False
 
-    def _has_customer_in_ocr(self, ocr_text, chat_img=None):
+    def _has_customer_in_ocr(self, ocr_text: str, chat_img: Image.Image = None) -> bool:
         """检测OCR文本或截图中有没有 @微信 客户标识"""
         if not ocr_text:
             return False
+        # OCR可能漏掉@符号，同时匹配 @微信 和 微信
         if '@微信' in ocr_text or '微信' in ocr_text:
             return True
         if chat_img is not None and self._has_green_badge(chat_img):
@@ -695,14 +716,12 @@ class WeComAssistant:
                         no_window_count = 0
 
                 # ═══ 2. 截图第二列（群聊列表） ═══
-                col2 = self._get_col2_region()
+                col2 = self._get_region(COL2_RATIO)
                 if not col2:
                     time.sleep(self.check_interval)
                     continue
 
                 col2_img = self._screenshot(col2)
-
-
 
                 # ═══ 3. 红点检测 ═══
                 red_dots = self._screen_red_dots(col2_img, col2)
@@ -730,7 +749,7 @@ class WeComAssistant:
                 self._click_chat_row(first_dot, col2)
 
                 # ═══ 5. 截图第三列（会话窗口） ═══
-                col3 = self._get_col3_region()
+                col3 = self._get_region(COL3_RATIO)
                 if not col3:
                     time.sleep(self.check_interval)
                     continue
@@ -739,53 +758,32 @@ class WeComAssistant:
                 session_img = self._screenshot(col3)
                 self._log("INFO", f"📸 会话截图: {session_img.size}")
 
-                # ═══ 6. 提取底部最新消息区域 ═══
-                col3_w, col3_h = session_img.size
-                # 聊天区：y从80到526，去掉右侧成员区域162px
-                chat_area = session_img.crop((0, 80, col3_w - 162, 526))
-
-                msg_img, is_blue = self._extract_bottom_message(chat_area)
-
-                if msg_img is None:
-                    # 没找到气泡，跳过
-                    self._log("INFO", "⏭️ 未找到消息区域，跳过")
-                    time.sleep(self.check_interval)
-                    continue
-
-                if is_blue:
-                    self._log("INFO", "⏭️ 最新消息是AI回复（蓝色气泡），跳过")
-                    time.sleep(self.check_interval)
-                    continue
-
-                # ═══ 7. OCR 识别底部消息 ═══
-                ocr_text = self._ocr_image(msg_img)
+                # ═══ 7. OCR 提取文字 ═══
+                # 截取聊天消息区全部宽度（去顶去底），先去蓝色气泡再 OCR
+                w, h = session_img.size
+                chat_area = session_img.crop((0, int(h * 0.06), w, int(h * 0.85)))
+                chat_area = self._remove_blue_bubbles(chat_area)
+                ocr_text = self._ocr_image(chat_area)
                 if not ocr_text:
                     self._log("WARN", "⚠️ OCR 未提取到文字，跳过")
                     time.sleep(2)
                     continue
 
-                self._log("INFO", f"📝 底部消息OCR ({len(ocr_text)}字符):")
-                for line in ocr_text.split("\n")[:5]:
+                self._log("INFO", f"📝 OCR 内容 ({len(ocr_text)}字符):")
+                for line in ocr_text.split("
+")[:5]:
                     if line.strip():
-                        self._log("INFO", f"   {line.strip()[:100]}")
+                        self._log("INFO", f"   {line.strip()[:80]}")
 
-                # ═══ 7.5 检测@微信（OCR文字 + 绿色像素检测兜底） ═══
-                has_wechat = '@微信' in ocr_text or '微信' in ocr_text
-                # 如果OCR没读到@微信，检查图中是否有绿色像素（@微信绿色badge）
-                if not has_wechat:
-                    green = self._has_green_badge(msg_img)
-                    if green:
-                        self._log("INFO", "🟢 绿色像素检测命中@微信!")
-                        has_wechat = True
-                
-                if not has_wechat:
-                    self._log("INFO", "⏭️ 无@微信标识（内部成员消息），跳过")
+                # ═══ 7.5 检测 @微信 客户标识 ═══
+                if not self._has_customer_in_ocr(ocr_text, chat_area):
+                    self._log("INFO", "⏭️ 跳过：未检测到@微信客户消息")
                     time.sleep(2)
                     continue
 
-                self._log("INFO", "🟢 检测到客户消息")
+                self._log("INFO", "🟢 检测到客户标识，生成回复")
 
-                # ═══ 冷却 ═══
+                # ═══ 冷却：防止同一群反复回复 ═══
                 now = time.time()
                 if now - self._last_reply_time < self._reply_cooldown:
                     remain = int(self._reply_cooldown - (now - self._last_reply_time))
@@ -828,9 +826,6 @@ class WeComAssistant:
                 self.executor.press_key("enter")
                 time.sleep(0.5)
                 self._log("INFO", "✅ 回复已发送 ✓")
-
-                # ═══ 9. 写入智能表格 ═══
-                self._save_to_smart_sheet(ocr_text, reply)
 
                 # ═══ 10. 冷却 ═══
                 time.sleep(1)
